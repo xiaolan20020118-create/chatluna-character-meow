@@ -4,6 +4,7 @@ import { createLogger } from 'koishi-plugin-chatluna/utils/logger'
 import { Config } from '..'
 import { Preset } from '../preset'
 import {
+    BotConfig,
     GroupLock,
     GroupTemp,
     Message,
@@ -16,14 +17,44 @@ import {
     isMessageContentImageUrl
 } from 'koishi-plugin-chatluna/utils/string'
 
+/**
+ * Bot 配置服务，允许外部插件注册和管理每个 bot 的配置
+ */
+class BotConfigService {
+    private _botConfigs: Record<string, BotConfig> = {}
+
+    setBotConfig(botId: string, config: BotConfig) {
+        this._botConfigs[botId] = config
+    }
+
+    getBotConfig(botId: string): BotConfig | undefined {
+        return this._botConfigs[botId]
+    }
+
+    hasBotConfig(botId: string): boolean {
+        return botId in this._botConfigs
+    }
+
+    clearBotConfig(botId: string) {
+        delete this._botConfigs[botId]
+    }
+
+    getAllConfigs(): Record<string, BotConfig> {
+        return { ...this._botConfigs }
+    }
+}
+
 export class MessageCollector extends Service {
-    private _messages: Record<string, Message[]> = {}
+    // 多 bot 支持：消息按 guildId:botId 存储
+    private _messages: Record<string, Record<string, Message[]>> = {}
 
     private _filters: MessageCollectorFilter[] = []
 
-    private _groupLocks: Record<string, GroupLock> = {}
+    // 多 bot 支持：锁也按 botId 隔离
+    private _groupLocks: Record<string, Record<string, GroupLock>> = {}
 
-    private _groupTemp: Record<string, GroupTemp> = {}
+    // 多 bot 支持：临时状态也按 botId 隔离
+    private _groupTemp: Record<string, Record<string, GroupTemp>> = {}
 
     private _responseWaiters: Record<
         string,
@@ -35,6 +66,9 @@ export class MessageCollector extends Service {
 
     preset: Preset
 
+    // Bot 配置服务，允许外部插件注册每个 bot 的预设和模型
+    botConfig: BotConfigService
+
     declare logger: Logger
 
     constructor(
@@ -44,6 +78,7 @@ export class MessageCollector extends Service {
         super(ctx, 'chatluna_character')
         this.logger = createLogger(ctx, 'chatluna-character')
         this.preset = new Preset(ctx)
+        this.botConfig = new BotConfigService()
     }
 
     addFilter(filter: MessageCollectorFilter) {
@@ -79,18 +114,25 @@ export class MessageCollector extends Service {
         this.ctx.on('chatluna_character/message_collect', func)
     }
 
-    getMessages(groupId: string) {
+    getMessages(groupId: string, botId: string): Message[] | undefined
+    getMessages(groupId: string): Record<string, Message[]> | undefined
+    getMessages(groupId: string, botId?: string) {
+        if (botId) {
+            return this._messages[groupId]?.[botId]
+        }
         return this._messages[groupId]
     }
 
     isMute(session: Session) {
-        const lock = this._getGroupLocks(session.guildId)
+        const botId = `${session.bot.platform}:${session.bot.selfId}`
+        const lock = this._getGroupLocks(session.guildId, botId)
 
         return lock.mute > new Date().getTime()
     }
 
     isResponseLocked(session: Session) {
-        const lock = this._getGroupLocks(session.guildId)
+        const botId = `${session.bot.platform}:${session.bot.selfId}`
+        const lock = this._getGroupLocks(session.guildId, botId)
         return lock.responseLock
     }
 
@@ -103,55 +145,61 @@ export class MessageCollector extends Service {
         message: Message
     ): Promise<boolean> {
         const groupId = session.guildId
+        const botId = `${session.bot.platform}:${session.bot.selfId}`
 
-        await this._lockByGroupId(groupId)
+        await this._lockByGroupId(groupId, botId)
 
-        const lock = this._getGroupLocks(groupId)
+        const lock = this._getGroupLocks(groupId, botId)
 
         if (!lock.responseLock) {
             lock.responseLock = true
-            this._unlockByGroupId(groupId)
+            this._unlockByGroupId(groupId, botId)
             return true
         }
 
         // Lock is held, create waiter while holding mutex
+        const botGuildKey = `${groupId}:${botId}`
         const waiterPromise = new Promise<boolean>((resolve) => {
-            if (!this._responseWaiters[groupId]) {
-                this._responseWaiters[groupId] = []
+            if (!this._responseWaiters[botGuildKey]) {
+                this._responseWaiters[botGuildKey] = []
             }
-            this._responseWaiters[groupId].push({
+            this._responseWaiters[botGuildKey].push({
                 resolve: () => resolve(true),
                 reject: () => resolve(false)
             })
         })
 
-        this._unlockByGroupId(groupId)
+        this._unlockByGroupId(groupId, botId)
 
         return waiterPromise
     }
 
     setResponseLock(session: Session) {
-        const lock = this._getGroupLocks(session.guildId)
+        const botId = `${session.bot.platform}:${session.bot.selfId}`
+        const lock = this._getGroupLocks(session.guildId, botId)
         lock.responseLock = true
     }
 
     async releaseResponseLock(session: Session) {
         const groupId = session.guildId
+        const botId = `${session.bot.platform}:${session.bot.selfId}`
 
-        await this._lockByGroupId(groupId)
+        await this._lockByGroupId(groupId, botId)
 
         try {
-            const lock = this._getGroupLocks(groupId)
+            const lock = this._getGroupLocks(groupId, botId)
+
+            const botGuildKey = `${groupId}:${botId}`
+            const waiters = this._responseWaiters[botGuildKey]
             lock.responseLock = false
 
-            const waiters = this._responseWaiters[groupId]
             if (waiters && waiters.length > 0) {
                 // Cancel all old waiters, only wake up the latest one
                 const latestWaiter = waiters.pop()
                 for (const waiter of waiters) {
                     waiter.reject()
                 }
-                this._responseWaiters[groupId] = []
+                this._responseWaiters[botGuildKey] = []
 
                 if (latestWaiter) {
                     lock.responseLock = true
@@ -159,61 +207,89 @@ export class MessageCollector extends Service {
                 }
             }
         } finally {
-            this._unlockByGroupId(groupId)
+            this._unlockByGroupId(groupId, botId)
         }
     }
 
     async cancelPendingWaiters(groupId: string) {
-        await this._lockByGroupId(groupId)
+        // 注意：此方法不支持 botId 参数，取消所有 bot 的等待
+        await this._lockByGroupId(groupId, undefined)
 
         try {
-            const waiters = this._responseWaiters[groupId]
-            if (waiters) {
-                for (const waiter of waiters) {
-                    waiter.reject('cancelled')
+            // 取消所有 bot 的等待
+            for (const botGuildKey of Object.keys(this._responseWaiters)) {
+                if (botGuildKey.startsWith(groupId + ':')) {
+                    const waiters = this._responseWaiters[botGuildKey]
+                    if (waiters) {
+                        for (const waiter of waiters) {
+                            waiter.reject('cancelled')
+                        }
+                        this._responseWaiters[botGuildKey] = []
+                    }
                 }
-                this._responseWaiters[groupId] = []
             }
         } finally {
-            this._unlockByGroupId(groupId)
+            this._unlockByGroupId(groupId, undefined)
         }
     }
 
     async updateTemp(session: Session, temp: GroupTemp) {
-        await this._lock(session)
+        const botId = `${session.bot.platform}:${session.bot.selfId}`
+        await this._lock(session, botId)
 
         const groupId = session.guildId
 
-        this._groupTemp[groupId] = temp
+        if (!this._groupTemp[groupId]) {
+            this._groupTemp[groupId] = {}
+        }
+        this._groupTemp[groupId][botId] = temp
 
-        await this._unlock(session)
+        await this._unlock(session, botId)
     }
 
     async getTemp(session: Session): Promise<GroupTemp> {
-        await this._lock(session)
+        const botId = `${session.bot.platform}:${session.bot.selfId}`
+        await this._lock(session, botId)
 
         const groupId = session.guildId
 
-        const temp = this._groupTemp[groupId] ?? {
+        const groupTemp = this._getGroupTemp(groupId, botId)
+        const temp = groupTemp ?? {
             completionMessages: []
         }
 
-        this._groupTemp[groupId] = temp
+        this._groupTemp[groupId][botId] = temp
 
-        await this._unlock(session)
+        await this._unlock(session, botId)
 
         return temp
     }
 
-    private _getGroupLocks(groupId: string) {
+    private _getGroupTemp(groupId: string, botId: string) {
+        if (!this._groupTemp[groupId]) {
+            this._groupTemp[groupId] = {}
+        }
+        if (!this._groupTemp[groupId][botId]) {
+            this._groupTemp[groupId][botId] = {
+                completionMessages: []
+            }
+        }
+        return this._groupTemp[groupId][botId]
+    }
+
+    private _getGroupLocks(groupId: string, botId?: string) {
         if (!this._groupLocks[groupId]) {
-            this._groupLocks[groupId] = {
+            this._groupLocks[groupId] = {}
+        }
+        const botKey = botId ?? 'default'
+        if (!this._groupLocks[groupId][botKey]) {
+            this._groupLocks[groupId][botKey] = {
                 lock: false,
                 mute: 0,
                 responseLock: false
             }
         }
-        return this._groupLocks[groupId]
+        return this._groupLocks[groupId][botKey]
     }
 
     private _getGroupConfig(groupId: string) {
@@ -224,8 +300,8 @@ export class MessageCollector extends Service {
         return Object.assign({}, config, config.configs[groupId])
     }
 
-    private _lock(session: Session) {
-        const groupLock = this._getGroupLocks(session.guildId)
+    private _lock(session: Session, botId?: string) {
+        const groupLock = this._getGroupLocks(session.guildId, botId)
         return new Promise<void>((resolve) => {
             const interval = setInterval(() => {
                 if (!groupLock.lock) {
@@ -237,8 +313,8 @@ export class MessageCollector extends Service {
         })
     }
 
-    private _unlock(session: Session) {
-        const groupLock = this._getGroupLocks(session.guildId)
+    private _unlock(session: Session, botId?: string) {
+        const groupLock = this._getGroupLocks(session.guildId, botId)
         return new Promise<void>((resolve) => {
             const interval = setInterval(() => {
                 if (groupLock.lock) {
@@ -250,8 +326,8 @@ export class MessageCollector extends Service {
         })
     }
 
-    private _lockByGroupId(groupId: string) {
-        const groupLock = this._getGroupLocks(groupId)
+    private _lockByGroupId(groupId: string, botId?: string) {
+        const groupLock = this._getGroupLocks(groupId, botId)
         return new Promise<void>((resolve) => {
             const interval = setInterval(() => {
                 if (!groupLock.lock) {
@@ -263,29 +339,32 @@ export class MessageCollector extends Service {
         })
     }
 
-    private _unlockByGroupId(groupId: string) {
-        const groupLock = this._getGroupLocks(groupId)
+    private _unlockByGroupId(groupId: string, botId?: string) {
+        const groupLock = this._getGroupLocks(groupId, botId)
         groupLock.lock = false
     }
 
     async clear(groupId?: string) {
         if (groupId) {
-            await this._lockByGroupId(groupId)
+            await this._lockByGroupId(groupId, undefined)
             try {
-                this._messages[groupId] = []
-                this._groupTemp[groupId] = {
-                    completionMessages: []
-                }
-                // Cancel waiters directly while holding lock
-                const waiters = this._responseWaiters[groupId]
-                if (waiters) {
-                    for (const waiter of waiters) {
-                        waiter.reject('cancelled')
+                this._messages[groupId] = {}
+                // 清除该群组下所有 bot 的临时状态
+                this._groupTemp[groupId] = {}
+                // Cancel waiters directly while holding lock (for all bots in this group)
+                for (const botGuildKey of Object.keys(this._responseWaiters)) {
+                    if (botGuildKey.startsWith(groupId + ':')) {
+                        const waiters = this._responseWaiters[botGuildKey]
+                        if (waiters) {
+                            for (const waiter of waiters) {
+                                waiter.reject('cancelled')
+                            }
+                            this._responseWaiters[botGuildKey] = []
+                        }
                     }
-                    this._responseWaiters[groupId] = []
                 }
             } finally {
-                this._unlockByGroupId(groupId)
+                this._unlockByGroupId(groupId, undefined)
             }
             return
         }
@@ -293,7 +372,7 @@ export class MessageCollector extends Service {
         // For clear-all, acquire locks in sorted order to prevent deadlocks
         const groupIds = Object.keys(this._groupLocks).sort()
         for (const gid of groupIds) {
-            await this._lockByGroupId(gid)
+            await this._lockByGroupId(gid, undefined)
         }
 
         try {
@@ -301,19 +380,19 @@ export class MessageCollector extends Service {
             this._groupTemp = {}
 
             // Cancel waiters directly while holding locks
-            for (const gid of groupIds) {
-                const waiters = this._responseWaiters[gid]
+            for (const botGuildKey of Object.keys(this._responseWaiters)) {
+                const waiters = this._responseWaiters[botGuildKey]
                 if (waiters) {
                     for (const waiter of waiters) {
                         waiter.reject('cancelled')
                     }
-                    this._responseWaiters[gid] = []
+                    this._responseWaiters[botGuildKey] = []
                 }
             }
         } finally {
             // Release in reverse order
             for (let i = groupIds.length - 1; i >= 0; i--) {
-                this._unlockByGroupId(groupIds[i])
+                this._unlockByGroupId(groupIds[i], undefined)
             }
         }
     }
@@ -345,7 +424,13 @@ export class MessageCollector extends Service {
             return
         }
 
+        const botId = `${session.bot.platform}:${session.bot.selfId}`
         const groupId = session.guildId
+
+        this.logger.info(
+            `[MessageCollector] 收集消息 - Bot: ${botId}, Guild: ${groupId}`
+        )
+
         const config = this._getGroupConfig(groupId)
 
         const images = config.image
@@ -363,7 +448,12 @@ export class MessageCollector extends Service {
             images
         )
 
+        this.logger.debug(
+            `[MessageCollector] 消息内容: ${content.length > 100 ? content.slice(0, 100) + '...' : content}`
+        )
+
         if (content.length < 1) {
+            this.logger.debug(`[MessageCollector] 消息内容为空，跳过`)
             return
         }
 
@@ -400,19 +490,32 @@ export class MessageCollector extends Service {
             processImages: config
         })
 
+        this.logger.info(
+            `[MessageCollector] shouldTrigger: ${shouldTrigger}, isMute: ${this.isMute(session)}`
+        )
+
         if (shouldTrigger && !this.isMute(session)) {
             const acquired = await this.acquireResponseLock(session, message)
             if (!acquired) {
                 // Cancelled, do not trigger
+                this.logger.debug(`[MessageCollector] 响应锁获取失败（已取消）`)
                 return false
             }
+            // 获取当前 bot 的消息历史
+            const messages = this._messages[groupId]?.[botId] ?? []
+            this.logger.info(
+                `[MessageCollector] 触发消息收集事件 - Bot: ${botId}, Guild: ${groupId}, 历史消息数: ${messages.length}`
+            )
             await this.ctx.parallel(
                 'chatluna_character/message_collect',
                 session,
-                this._messages[groupId]
+                messages
             )
             return true
         } else {
+            this.logger.debug(
+                `[MessageCollector] 不触发响应 - shouldTrigger: ${shouldTrigger}, isMute: ${this.isMute(session)}`
+            )
             return this.isMute(session)
         }
     }
@@ -425,12 +528,22 @@ export class MessageCollector extends Service {
             processImages?: Config
         }
     ): Promise<boolean> {
-        await this._lock(session)
+        const botId = `${session.bot.platform}:${session.bot.selfId}`
+        await this._lock(session, botId)
 
         try {
             const groupId = session.guildId
             const maxMessageSize = this._config.maxMessages
-            let groupArray = this._messages[groupId] ?? []
+
+            // 按 botId 存储消息
+            if (!this._messages[groupId]) {
+                this._messages[groupId] = {}
+            }
+            let groupArray = this._messages[groupId][botId] ?? []
+
+            this.logger.debug(
+                `[MessageCollector] 添加消息前 - Bot: ${botId}, Guild: ${groupId}, 消息数: ${groupArray.length}`
+            )
 
             groupArray.push(message)
 
@@ -438,7 +551,12 @@ export class MessageCollector extends Service {
                 groupArray.shift()
             }
 
+            this.logger.debug(
+                `[MessageCollector] 添加消息后 - 消息数: ${groupArray.length} (max: ${maxMessageSize})`
+            )
+
             if (options?.filterExpiredMessages) {
+                const beforeFilter = groupArray.length
                 const now = Date.now()
                 groupArray = groupArray.filter((msg) => {
                     return (
@@ -446,17 +564,25 @@ export class MessageCollector extends Service {
                         msg.timestamp >= now - Time.hour
                     )
                 })
+                this.logger.debug(
+                    `[MessageCollector] 过期消息过滤 - 前: ${beforeFilter}, 后: ${groupArray.length}`
+                )
             }
 
             if (options?.processImages) {
                 await this._processImages(groupArray, options.processImages)
             }
 
-            this._messages[groupId] = groupArray
+            this._messages[groupId][botId] = groupArray
 
-            return this._filters.some((func) => func(session, message))
+            const filterResult = this._filters.some((func) =>
+                func(session, message)
+            )
+            this.logger.debug(`[MessageCollector] 过滤器结果: ${filterResult}`)
+
+            return filterResult
         } finally {
-            await this._unlock(session)
+            await this._unlock(session, botId)
         }
     }
 
@@ -659,17 +785,5 @@ export function getNotEmptyString(...texts: (string | undefined)[]): string {
         if (text && text?.length > 0) {
             return text
         }
-    }
-}
-
-declare module 'koishi' {
-    export interface Context {
-        chatluna_character: MessageCollector
-    }
-    export interface Events {
-        'chatluna_character/message_collect': (
-            session: Session,
-            message: Message[]
-        ) => void | Promise<void>
     }
 }

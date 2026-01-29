@@ -1,5 +1,5 @@
 {
-    "name": "koishi-plugin-chatluna-character",
+    "name": "@kotoko76/koishi-plugin-chatluna-character",
     "description": "Let the large language model play a role, disguise as a group friend",
     "version": "0.0.188",
     "type": "module",
@@ -30,16 +30,16 @@
         "preset",
         "market"
     ],
-    "author": "dingyi222666 <dingyi222666@foxmail.com>",
+    "author": "kotoko76",
     "repository": {
         "type": "git",
-        "url": "https://github.com/ChatLunaLab/chatluna-character.git",
+        "url": "https://github.com/xiaolan20020118-create/chatluna-character-meow.git",
         "directory": "."
     },
     "bugs": {
-        "url": "https://github.com/ChatLunaLab/chatluna-character/issues"
+        "url": "https://github.com/xiaolan20020118-create/chatluna-character-meow/issues"
     },
-    "homepage": "https://github.com/ChatLunaLab/chatluna-character#readme",
+    "homepage": "https://github.com/xiaolan20020118-create/chatluna-character-meow#readme",
     "dependencies": {
         "@langchain/core": "^0.3.80",
         "he": "^1.2.0",
@@ -76,7 +76,7 @@
     "scripts": {
         "process-dynamic-import": "node ./processDynamicImport.js",
         "fast-build": "yarn yakumo build",
-        "build": "yarn process-dynamic-import && yarn fast-build",
+        "build": "yarn process-dynamic-import && yarn fast-build && node -e \"require('fs').copyFileSync('src/global.ts', 'lib/global.d.ts')\"",
         "bump": "yarn yakumo version",
         "dep": "yarn yakumo upgrade",
         "pub": "yarn yakumo publish",

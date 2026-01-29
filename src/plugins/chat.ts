@@ -10,7 +10,14 @@ import { Context, h, Logger, Random, Session, sleep } from 'koishi'
 import { ChatLunaChatModel } from 'koishi-plugin-chatluna/llm-core/platform/model'
 import { parseRawModelName } from 'koishi-plugin-chatluna/llm-core/utils/count_tokens'
 import { Config } from '..'
-import { ChatLunaChain, GroupTemp, Message, PresetTemplate } from '../types'
+import {
+    BotConfig,
+    ChatLunaChain,
+    GroupTemp,
+    Message,
+    PresetTemplate
+} from '../types'
+import { MessageCollector } from '../service/message'
 import {
     createChatLunaChain,
     formatCompletionMessages,
@@ -44,10 +51,12 @@ async function initializeModel(
 
 async function setupModelPool(
     ctx: Context,
-    config: Config
+    config: Config,
+    service: MessageCollector
 ): Promise<{
     globalModel: ComputedRef<ChatLunaChatModel>
     modelPool: Record<string, Promise<ComputedRef<ChatLunaChatModel>>>
+    modelNamePool: Record<string, string>
 }> {
     const [platform, modelName] = parseRawModelName(config.model)
     const globalModel = await initializeModel(ctx, platform, modelName)
@@ -57,10 +66,37 @@ async function setupModelPool(
         string,
         Promise<ComputedRef<ChatLunaChatModel>>
     > = {}
+    const modelNamePool: Record<string, string> = {}
 
+    // 从 charon 注册的 bot 配置加载 bot 级别模型
+    const allBotConfigs: Record<string, BotConfig> =
+        service.botConfig.getAllConfigs()
+    for (const [botId, botConfig] of Object.entries(allBotConfigs)) {
+        if (botConfig.model) {
+            const [platform, modelName] = parseRawModelName(botConfig.model)
+            modelNamePool[botId] = botConfig.model
+            modelPool[botId] = (async () => {
+                const loadedModel = await initializeModel(
+                    ctx,
+                    platform,
+                    modelName
+                )
+                logger.info(
+                    'bot model loaded %c for bot %c',
+                    botConfig.model,
+                    botId
+                )
+                return loadedModel
+            })()
+        }
+    }
+
+    // guild 级别的模型覆盖（兼容原有配置）
     if (config.modelOverride?.length > 0) {
         for (const override of config.modelOverride) {
-            modelPool[override.groupId] = (async () => {
+            const key = `guild:${override.groupId}`
+            modelNamePool[key] = override.model
+            modelPool[key] = (async () => {
                 const [platform, modelName] = parseRawModelName(override.model)
                 const loadedModel = await initializeModel(
                     ctx,
@@ -74,49 +110,95 @@ async function setupModelPool(
                     override.groupId
                 )
 
-                modelPool[override.groupId] = Promise.resolve(loadedModel)
                 return loadedModel
             })()
         }
     }
 
-    return { globalModel, modelPool }
+    return { globalModel, modelPool, modelNamePool }
 }
 
 async function getModelForGuild(
     guildId: string,
+    botId: string,
     globalModel: ComputedRef<ChatLunaChatModel>,
     modelPool: Record<string, Promise<ComputedRef<ChatLunaChatModel>>>
 ): Promise<ComputedRef<ChatLunaChatModel>> {
-    return await (modelPool[guildId] ?? Promise.resolve(globalModel))
+    // 优先查找 bot 级别的模型
+    if (modelPool[botId]) {
+        return await modelPool[botId]
+    }
+    // 其次查找 guild 级别的模型覆盖
+    const guildKey = `guild:${guildId}`
+    if (modelPool[guildKey]) {
+        return await modelPool[guildKey]
+    }
+    // 默认使用全局模型
+    return globalModel
+}
+
+function getModelNameForGuild(
+    guildId: string,
+    botId: string,
+    globalModelName: string,
+    modelNamePool: Record<string, string>
+): string {
+    // 优先查找 bot 级别的模型名称
+    if (modelNamePool[botId]) {
+        return modelNamePool[botId]
+    }
+    // 其次查找 guild 级别的模型名称
+    const guildKey = `guild:${guildId}`
+    if (modelNamePool[guildKey]) {
+        return modelNamePool[guildKey]
+    }
+    // 默认使用全局模型名称
+    return globalModelName
 }
 
 async function getConfigAndPresetForGuild(
     guildId: string,
+    botId: string,
     config: Config,
     globalPreset: PresetTemplate,
     presetPool: Record<string, PresetTemplate>,
-    preset: Preset
+    preset: Preset,
+    service: MessageCollector
 ): Promise<{ copyOfConfig: Config; currentPreset: PresetTemplate }> {
     const currentGuildConfig = config.configs[guildId]
-    let copyOfConfig = { ...config }
+    let copyOfConfig = Object.assign({}, config)
     let currentPreset = globalPreset
+    let presetName = config.defaultPreset
+
+    // 优先使用 bot 配置的预设
+    const botConfig = service.botConfig.getBotConfig(botId)
+    if (botConfig?.preset) {
+        presetName = botConfig.preset
+    } else if (currentGuildConfig?.preset) {
+        presetName = currentGuildConfig.preset
+    }
+
+    // 加载预设 - 使用 botId 作为缓存键的一部分
+    const presetKey = `${guildId}:${botId}`
+    if (presetPool[presetKey]) {
+        currentPreset = presetPool[presetKey]
+        logger.debug(`[Chat] 从缓存加载预设: ${currentPreset.name}`)
+    } else {
+        const template = preset.getPresetForCache(presetName)
+        presetPool[presetKey] = template
+        currentPreset = template
+        logger.debug(`[Chat] 新加载预设: ${currentPreset.name}`)
+    }
+
+    // 验证预设内容
+    if (config.verboseLogging) {
+        logger.info(
+            `[Chat] 预设验证 - name:${currentPreset.name}, nick_name:${JSON.stringify(currentPreset.nick_name)}, system开头:${currentPreset.system.rawString.slice(0, 50)}`
+        )
+    }
 
     if (currentGuildConfig) {
         copyOfConfig = Object.assign({}, copyOfConfig, currentGuildConfig)
-        currentPreset =
-            presetPool[guildId] ??
-            (await (async () => {
-                const template = preset.getPresetForCache(
-                    currentGuildConfig.preset
-                )
-                presetPool[guildId] = template
-                return template
-            })())
-
-        logger.debug(
-            `override config: ${JSON.stringify(copyOfConfig)} for guild ${guildId}`
-        )
     }
 
     return { copyOfConfig, currentPreset }
@@ -174,7 +256,7 @@ async function prepareMessages(
                 prompt: session.content,
                 built: {
                     preset: currentPreset.name,
-                    conversationId: session.guildId
+                    conversationId: `${session.guildId}:${session.bot.platform}:${session.bot.selfId}`
                 }
             },
             session.app.chatluna.promptRenderer,
@@ -253,7 +335,7 @@ async function getModelResponse(
                               session,
                               model,
                               userId: session.userId,
-                              conversationId: session.guildId
+                              conversationId: `${session.guildId}:${session.bot.platform}:${session.bot.selfId}`
                           }
                       }
                   )
@@ -451,7 +533,11 @@ export async function apply(ctx: Context, config: Config) {
 
     setLogger(logger)
 
-    const { globalModel, modelPool } = await setupModelPool(ctx, config)
+    const { globalModel, modelPool, modelNamePool } = await setupModelPool(
+        ctx,
+        config,
+        service
+    )
 
     let globalPreset = preset.getPresetForCache(config.defaultPreset)
     let presetPool: Record<string, PresetTemplate> = {}
@@ -465,29 +551,48 @@ export async function apply(ctx: Context, config: Config) {
 
     service.collect(async (session, messages) => {
         const guildId = session.event.guild?.id ?? session.guildId
+        // 使用完整的 botId 格式 (platform:selfId) 以匹配 charon 注册的配置
+        const botId = `${session.bot.platform}:${session.bot.selfId}`
 
         try {
             const model = await getModelForGuild(
                 guildId,
+                botId,
                 globalModel,
                 modelPool
+            )
+
+            const modelName = getModelNameForGuild(
+                guildId,
+                botId,
+                config.model,
+                modelNamePool
             )
 
             const { copyOfConfig, currentPreset } =
                 await getConfigAndPresetForGuild(
                     guildId,
+                    botId,
                     config,
                     globalPreset,
                     presetPool,
-                    preset
+                    preset,
+                    service
                 )
 
             if (model.value == null) {
                 logger.warn(
-                    `Model ${copyOfConfig.model} load not successful. Please check your logs output.`
+                    `Model ${modelName} load not successful. Please check your logs output.`
                 )
                 return
             }
+
+            if (copyOfConfig.verboseLogging) {
+                logger.info(`[Chat] ========== 开始处理 ==========`)
+            }
+            logger.info(
+                `[Chat] Bot: ${botId} | 预设: ${currentPreset.name} | 模型: ${modelName} | 历史: ${messages.length}条`
+            )
 
             if (copyOfConfig.toolCalling) {
                 chainPool[guildId] =
@@ -496,7 +601,8 @@ export async function apply(ctx: Context, config: Config) {
             }
 
             const temp = await service.getTemp(session)
-            const latestMessages = service.getMessages(guildId) ?? messages
+            const latestMessages =
+                service.getMessages(guildId, botId) ?? messages
             const focusMessage = latestMessages[latestMessages.length - 1]
 
             const completionMessages = await prepareMessages(
@@ -532,8 +638,19 @@ export async function apply(ctx: Context, config: Config) {
 
             const { responseMessage, parsedResponse } = response
 
+            if (copyOfConfig.verboseLogging) {
+                logger.info(`[Chat] ========== 响应 ==========`)
+                logger.info(
+                    `[Chat] 类型: ${parsedResponse.messageType}, 元素: ${parsedResponse.elements.length}个`
+                )
+                if (parsedResponse.status) {
+                    logger.info(`[Chat] 状态: ${parsedResponse.status}`)
+                }
+            }
+
             temp.status = parsedResponse.status
             if (parsedResponse.elements.length < 1) {
+                logger.warn(`[Chat] 响应为空，执行禁言`)
                 service.mute(session, copyOfConfig.muteTime)
                 return
             }
@@ -556,8 +673,11 @@ export async function apply(ctx: Context, config: Config) {
             )
 
             service.muteAtLeast(session, copyOfConfig.coolDownTime * 1000)
+            if (copyOfConfig.verboseLogging) {
+                logger.info(`[Chat] ========== 处理完成 ==========`)
+            }
         } catch (e) {
-            logger.error(e)
+            logger.error(`[Chat] 处理出错: ${e}`)
         } finally {
             service.releaseResponseLock(session)
         }

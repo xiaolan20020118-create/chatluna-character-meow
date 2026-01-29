@@ -6,6 +6,9 @@ import { plugins } from './plugin'
 import { MessageCollector } from './service/message'
 import { GuildConfig } from './types'
 
+// Import global types for Context augmentation
+import './global'
+
 export function apply(ctx: Context, config: Config) {
     ctx.plugin(MessageCollector, config)
 
@@ -105,6 +108,7 @@ export interface Config extends ChatLunaPlugin.Config {
 
     disableChatLuna: boolean
     whiteListDisableChatLuna: string[]
+    verboseLogging: boolean
 
     splitVoice: boolean
     splitSentence: boolean
@@ -127,7 +131,10 @@ export const Config = Schema.intersect([
             .description('在使用此插件的群聊里，是否禁用 ChatLuna 主功能'),
         whiteListDisableChatLuna: Schema.array(Schema.string()).description(
             '在使用此插件时，不禁用 ChatLuna 主功能的群聊列表'
-        )
+        ),
+        verboseLogging: Schema.boolean()
+            .description('显示详细日志（关闭后只输出关键日志）')
+            .default(false)
     }).description('基础配置'),
 
     Schema.object({
@@ -395,3 +402,6 @@ export const Config = Schema.intersect([
 ]) as unknown as Schema<Config>
 
 export const name = 'chatluna-character'
+
+// Export types for external plugins (e.g., charon)
+export type { BotConfig } from './types'

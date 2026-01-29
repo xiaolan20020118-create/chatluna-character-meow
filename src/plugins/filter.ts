@@ -60,26 +60,56 @@ export async function apply(ctx: Context, config: Config) {
 
     service.addFilter((session, message) => {
         const guildId = session.guildId
+        // 使用完整的 botId 格式 (platform:selfId) 以匹配 charon 注册的配置
+        const botId = `${session.bot.platform}:${session.bot.selfId}`
+        const botGuildKey = `${botId}_${guildId}`
+        const presetKey = `${guildId}:${botId}`
         const now = Date.now()
 
+        const senderName =
+            message.name ??
+            session.author?.nick ??
+            session.author?.name ??
+            session.username ??
+            'Unknown'
+        const messageContent = message.content ?? ''
+
+        logger.info(
+            `[Filter] Bot: ${botId} | Guild: ${guildId} | Sender: ${senderName} | Msg: ${messageContent.length > 50 ? messageContent.slice(0, 50) + '...' : messageContent}`
+        )
+
+        // 优先使用 charon 注册的 bot 配置
+        const botConfig = service.botConfig.getBotConfig(botId)
         const currentGuildConfig = config.configs[guildId]
-        let copyOfConfig = Object.assign({}, config)
+        const copyOfConfig = Object.assign({}, config)
         let currentPreset = globalPreset
 
-        if (currentGuildConfig != null) {
-            copyOfConfig = Object.assign({}, copyOfConfig, currentGuildConfig)
-            currentPreset =
-                presetPool[guildId] ??
-                (() => {
-                    const template = preset.getPresetForCache(
-                        currentGuildConfig.preset
-                    )
-                    presetPool[guildId] = template
-                    return template
-                })()
+        // 确定使用的预设名称（优先级：bot配置 > guild配置 > 全局配置）
+        let presetName = config.defaultPreset
+        if (botConfig?.preset) {
+            presetName = botConfig.preset
+        } else if (currentGuildConfig?.preset) {
+            presetName = currentGuildConfig.preset
         }
 
-        const info = groupInfos[guildId] ?? {
+        // 加载预设
+        if (presetPool[presetKey]) {
+            currentPreset = presetPool[presetKey]
+        } else {
+            const template = preset.getPresetForCache(presetName)
+            presetPool[presetKey] = template
+            currentPreset = template
+            if (config.verboseLogging) {
+                const configSource = botConfig?.preset
+                    ? 'charon'
+                    : currentGuildConfig?.preset
+                      ? 'guild'
+                      : 'global'
+                logger.info(`[Filter] 预设: ${presetName} (来源: ${configSource})`)
+            }
+        }
+
+        const info = groupInfos[botGuildKey] ?? {
             messageCount: 0,
             messageTimestamps: [],
             lastActivityScore: 0,
@@ -122,7 +152,10 @@ export async function apply(ctx: Context, config: Config) {
             copyOfConfig.whiteListDisableChatLuna.includes(guildId)
         ) {
             const selfId = session.bot.userId ?? session.bot.selfId ?? '0'
-            const guildMessages = ctx.chatluna_character.getMessages(guildId)
+            const guildMessages = ctx.chatluna_character.getMessages(
+                guildId,
+                botId
+            )
 
             let maxRecentMessage = 0
 
@@ -147,7 +180,6 @@ export async function apply(ctx: Context, config: Config) {
         }
 
         let appel = session.stripped.appel
-        const botId = session.bot.selfId
 
         if (!appel) {
             // 从消息元素中检测是否有被艾特当前用户
@@ -162,6 +194,7 @@ export async function apply(ctx: Context, config: Config) {
         }
 
         const isAppel = Boolean(appel)
+
         const muteKeywords = currentPreset.mute_keyword ?? []
         const forceMuteActive =
             copyOfConfig.isForceMute && isAppel && muteKeywords.length > 0
@@ -183,28 +216,43 @@ export async function apply(ctx: Context, config: Config) {
             )
 
             if (needMute) {
-                logger.debug(`mute content: ${message.content}`)
+                logger.info(
+                    `[Filter] 触发静默关键词，禁言 ${config.muteTime}ms`
+                )
                 service.mute(session, config.muteTime)
             }
         }
 
         const isMute = service.isMute(session)
 
-        const isDirectTrigger =
-            isAppel ||
-            (copyOfConfig.isNickname &&
-                currentPreset.nick_name.some((value) =>
-                    plainTextContent.startsWith(value)
-                )) ||
-            (copyOfConfig.isNickNameWithContent &&
-                currentPreset.nick_name.some((value) =>
-                    plainTextContent.includes(value)
-                ))
+        // 昵称匹配检测
+        const isNickname =
+            copyOfConfig.isNickname &&
+            currentPreset.nick_name.some((value) =>
+                plainTextContent.startsWith(value)
+            )
+        const isNicknameWithContent =
+            copyOfConfig.isNickNameWithContent &&
+            currentPreset.nick_name.some((value) =>
+                plainTextContent.includes(value)
+            )
+
+        const isDirectTrigger = isAppel || isNickname || isNicknameWithContent
+        const messageIntervalCheck =
+            info.messageCount > copyOfConfig.messageInterval
+        const activityScoreCheck =
+            info.lastActivityScore >= info.currentActivityThreshold
 
         const shouldRespond =
-            info.messageCount > copyOfConfig.messageInterval ||
-            isDirectTrigger ||
-            info.lastActivityScore >= info.currentActivityThreshold
+            messageIntervalCheck || isDirectTrigger || activityScoreCheck
+
+        // 合并触发判断日志
+        logger.info(
+            `[Filter] 触发判断: isMute=${isMute}, @=${isAppel}, nickname=${isNickname || isNicknameWithContent}, ` +
+                `msgCount=${info.messageCount}/${copyOfConfig.messageInterval}, ` +
+                `activity=${info.lastActivityScore.toFixed(3)}/${info.currentActivityThreshold.toFixed(3)} => ` +
+                `WILL_${shouldRespond && !isMute ? 'RESPOND' : 'SKIP'}`
+        )
 
         if (shouldRespond && !isMute) {
             info.messageCount = 0
@@ -225,12 +273,12 @@ export async function apply(ctx: Context, config: Config) {
                 Math.min(lowerLimit, upperLimit)
             )
 
-            groupInfos[session.guildId] = info
+            groupInfos[botGuildKey] = info
             return true
         }
 
         info.messageCount++
-        groupInfos[session.guildId] = info
+        groupInfos[botGuildKey] = info
         return false
     })
 }

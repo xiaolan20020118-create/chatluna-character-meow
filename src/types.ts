@@ -109,3 +109,11 @@ export type MessageImage = {
     hash: string
     formatted: string
 }
+
+/**
+ * Bot 配置接口，用于外部插件（如 charon）注册每个 bot 的预设和模型
+ */
+export interface BotConfig {
+    preset?: string
+    model?: string
+}

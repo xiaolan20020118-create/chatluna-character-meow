@@ -39,7 +39,10 @@ export function apply(ctx: Context, config: Config) {
 
             const selfId = session.bot.userId ?? session.bot.selfId ?? '0'
 
-            const guildMessages = ctx.chatluna_character.getMessages(guildId)
+            const guildMessages = ctx.chatluna_character.getMessages(
+                guildId,
+                session.bot.selfId
+            )
 
             if (guildMessages == null || guildMessages.length === 0) {
                 return true
