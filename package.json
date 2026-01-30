@@ -1,7 +1,7 @@
 {
     "name": "@kotoko76/koishi-plugin-chatluna-character",
-    "description": "Let the large language model play a role, disguise as a group friend",
-    "version": "0.0.188",
+    "description": "Enable multiple bots to use their own presets and large language models for role-playing, disguising themselves as group members. A special version designed to work with the multi-bot-controller-chatluna-charon plugin",
+    "version": "0.1.1",
     "type": "module",
     "main": "lib/index.cjs",
     "module": "lib/index.mjs",
@@ -99,7 +99,7 @@
     },
     "koishi": {
         "description": {
-            "zh": "让大语言模型进行角色扮演，伪装成群友"
+            "zh": "让多个 bot 使用各自的预设和大语言模型进行角色扮演，伪装成群友。与 multi-bot-controller-chatluna-charon 插件配合使用的特供版本"
         },
         "service": {
             "required": [

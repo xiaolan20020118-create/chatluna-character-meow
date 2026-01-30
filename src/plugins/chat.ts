@@ -549,6 +549,36 @@ export async function apply(ctx: Context, config: Config) {
         presetPool = {}
     })
 
+    // 监听 bot 配置更新事件（来自 Charon 插件）
+    // 当 Charon 更新 bot 配置时，动态更新模型池
+    ctx.on(
+        'chatluna_character/bot-config-updated',
+        async (botId: string, botConfig: BotConfig) => {
+            if (botConfig.model) {
+                const [platform, modelName] = parseRawModelName(botConfig.model)
+                modelNamePool[botId] = botConfig.model
+                modelPool[botId] = (async () => {
+                    const loadedModel = await initializeModel(
+                        ctx,
+                        platform,
+                        modelName
+                    )
+                    logger.info(
+                        'bot model updated %c for bot %c',
+                        botConfig.model,
+                        botId
+                    )
+                    return loadedModel
+                })()
+            } else {
+                // 如果模型为空，移除该 bot 的模型配置
+                delete modelNamePool[botId]
+                delete modelPool[botId]
+                logger.info('bot model removed for bot %c', botId)
+            }
+        }
+    )
+
     service.collect(async (session, messages) => {
         const guildId = session.event.guild?.id ?? session.guildId
         // 使用完整的 botId 格式 (platform:selfId) 以匹配 charon 注册的配置

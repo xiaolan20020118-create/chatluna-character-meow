@@ -5,7 +5,6 @@ import { Config } from '..'
 import { Preset } from '../preset'
 import {
     BotConfig,
-    GroupLock,
     GroupTemp,
     Message,
     MessageCollectorFilter,
@@ -18,13 +17,217 @@ import {
 } from 'koishi-plugin-chatluna/utils/string'
 
 /**
+ * 互斥锁 - 用于保护共享状态访问
+ */
+class Mutex {
+    private _locked = false
+    private _waiters: (() => void)[] = []
+
+    async acquire(): Promise<void> {
+        if (!this._locked) {
+            this._locked = true
+            return
+        }
+
+        return new Promise<void>((resolve) => {
+            this._waiters.push(resolve)
+        })
+    }
+
+    release(): void {
+        const next = this._waiters.shift()
+        if (next) {
+            next()
+        } else {
+            this._locked = false
+        }
+    }
+}
+
+/**
+ * 响应锁 - 控制响应顺序
+ * 只保留最新的等待者，其他的会被取消
+ */
+class ResponseLock {
+    private _locked = false
+    private _waiters: {
+        resolve: (value: boolean) => void
+        reject: (value: boolean) => void
+    }[] = []
+
+    async acquire(): Promise<boolean> {
+        if (!this._locked) {
+            this._locked = true
+            return true
+        }
+
+        return new Promise<boolean>((resolve) => {
+            this._waiters.push({
+                resolve: (value: boolean) => resolve(value),
+                reject: () => resolve(false)
+            })
+        })
+    }
+
+    release(): void {
+        const latest = this._waiters.pop()
+
+        // 取消所有旧的等待者，只唤醒最新的一个
+        for (const waiter of this._waiters) {
+            waiter.reject(false)
+        }
+        this._waiters = []
+
+        if (latest) {
+            this._locked = true
+            latest.resolve(true)
+        } else {
+            this._locked = false
+        }
+    }
+
+    cancelAll(): void {
+        for (const waiter of this._waiters) {
+            waiter.reject(false)
+        }
+        this._waiters = []
+        this._locked = false
+    }
+}
+
+/**
+ * 统一锁管理器
+ */
+class LockManager {
+    private _mutexes: Map<string, Mutex> = new Map()
+    private _responseLocks: Map<string, ResponseLock> = new Map()
+
+    async acquireMutex(guildId: string, botId: string): Promise<void> {
+        const key = `${guildId}:${botId}`
+        let mutex = this._mutexes.get(key)
+        if (!mutex) {
+            mutex = new Mutex()
+            this._mutexes.set(key, mutex)
+        }
+        await mutex.acquire()
+    }
+
+    releaseMutex(guildId: string, botId: string): void {
+        const key = `${guildId}:${botId}`
+        const mutex = this._mutexes.get(key)
+        if (mutex) {
+            mutex.release()
+        }
+    }
+
+    async acquireResponseLock(
+        guildId: string,
+        botId: string
+    ): Promise<boolean> {
+        await this.acquireMutex(guildId, botId)
+
+        try {
+            const key = `${guildId}:${botId}`
+            let responseLock = this._responseLocks.get(key)
+
+            if (!responseLock) {
+                responseLock = new ResponseLock()
+                this._responseLocks.set(key, responseLock)
+            }
+
+            return await responseLock.acquire()
+        } finally {
+            this.releaseMutex(guildId, botId)
+        }
+    }
+
+    async releaseResponseLock(guildId: string, botId: string): Promise<void> {
+        await this.acquireMutex(guildId, botId)
+
+        try {
+            const key = `${guildId}:${botId}`
+            const responseLock = this._responseLocks.get(key)
+            if (responseLock) {
+                responseLock.release()
+            }
+        } finally {
+            this.releaseMutex(guildId, botId)
+        }
+    }
+
+    async cancelResponseWaiters(guildId: string): Promise<void> {
+        const prefix = `${guildId}:`
+        const keysToCancel: string[] = []
+
+        for (const key of this._responseLocks.keys()) {
+            if (key.startsWith(prefix)) {
+                keysToCancel.push(key)
+            }
+        }
+
+        keysToCancel.sort()
+
+        for (const key of keysToCancel) {
+            const [, botId] = key.split(':')
+            await this.acquireMutex(guildId, botId)
+        }
+
+        try {
+            for (const key of keysToCancel) {
+                const responseLock = this._responseLocks.get(key)
+                if (responseLock) {
+                    responseLock.cancelAll()
+                }
+            }
+        } finally {
+            for (const key of keysToCancel) {
+                const [, botId] = key.split(':')
+                this.releaseMutex(guildId, botId)
+            }
+        }
+    }
+
+    clearGuild(guildId: string): void {
+        for (const key of this._mutexes.keys()) {
+            if (key.startsWith(`${guildId}:`)) {
+                this._mutexes.delete(key)
+            }
+        }
+
+        for (const key of this._responseLocks.keys()) {
+            if (key.startsWith(`${guildId}:`)) {
+                this._responseLocks.delete(key)
+            }
+        }
+    }
+
+    dispose(): void {
+        this._mutexes.clear()
+        this._responseLocks.clear()
+    }
+}
+
+/**
  * Bot 配置服务，允许外部插件注册和管理每个 bot 的配置
  */
 class BotConfigService {
     private _botConfigs: Record<string, BotConfig> = {}
+    private _ctx: Context
+
+    constructor(ctx: Context) {
+        this._ctx = ctx
+    }
 
     setBotConfig(botId: string, config: BotConfig) {
+        const oldConfig = this._botConfigs[botId]
         this._botConfigs[botId] = config
+        // 触发配置更新事件，使 character 插件可以重新加载模型池
+        this._ctx.emit(
+            'chatluna_character/bot-config-updated',
+            botId,
+            config,
+            oldConfig
+        )
     }
 
     getBotConfig(botId: string): BotConfig | undefined {
@@ -50,19 +253,14 @@ export class MessageCollector extends Service {
 
     private _filters: MessageCollectorFilter[] = []
 
-    // 多 bot 支持：锁也按 botId 隔离
-    private _groupLocks: Record<string, Record<string, GroupLock>> = {}
+    // Mute 状态按 botId 隔离（不再需要 lock 和 responseLock）
+    private _muteStates: Record<string, Record<string, { mute: number }>> = {}
 
     // 多 bot 支持：临时状态也按 botId 隔离
     private _groupTemp: Record<string, Record<string, GroupTemp>> = {}
 
-    private _responseWaiters: Record<
-        string,
-        {
-            resolve: () => void
-            reject: (reason?: string) => void
-        }[]
-    > = {}
+    // 统一锁管理器
+    private _lockManager: LockManager
 
     preset: Preset
 
@@ -78,7 +276,8 @@ export class MessageCollector extends Service {
         super(ctx, 'chatluna_character')
         this.logger = createLogger(ctx, 'chatluna-character')
         this.preset = new Preset(ctx)
-        this.botConfig = new BotConfigService()
+        this.botConfig = new BotConfigService(ctx)
+        this._lockManager = new LockManager()
     }
 
     addFilter(filter: MessageCollectorFilter) {
@@ -86,27 +285,27 @@ export class MessageCollector extends Service {
     }
 
     mute(session: Session, time: number) {
-        const lock = this._getGroupLocks(session.guildId)
-        let mute = lock.mute ?? 0
+        const botId = `${session.bot.platform}:${session.bot.selfId}`
+        const muteState = this._getMuteState(session.guildId, botId)
 
         if (time === 0) {
-            mute = 0
-        } else if (mute < new Date().getTime()) {
-            mute = new Date().getTime() + time
+            muteState.mute = 0
+        } else if (muteState.mute < new Date().getTime()) {
+            muteState.mute = new Date().getTime() + time
         } else {
-            mute = mute + time
+            muteState.mute = muteState.mute + time
         }
-        lock.mute = mute
     }
 
     async muteAtLeast(session: Session, time: number) {
+        const botId = `${session.bot.platform}:${session.bot.selfId}`
         const groupId = session.guildId
-        await this._lockByGroupId(groupId)
+        await this._lockManager.acquireMutex(groupId, botId)
         try {
-            const groupLock = this._getGroupLocks(groupId)
-            groupLock.mute = Math.max(groupLock.mute ?? 0, Date.now() + time)
+            const muteState = this._getMuteState(groupId, botId)
+            muteState.mute = Math.max(muteState.mute ?? 0, Date.now() + time)
         } finally {
-            this._unlockByGroupId(groupId)
+            this._lockManager.releaseMutex(groupId, botId)
         }
     }
 
@@ -125,15 +324,8 @@ export class MessageCollector extends Service {
 
     isMute(session: Session) {
         const botId = `${session.bot.platform}:${session.bot.selfId}`
-        const lock = this._getGroupLocks(session.guildId, botId)
-
-        return lock.mute > new Date().getTime()
-    }
-
-    isResponseLocked(session: Session) {
-        const botId = `${session.bot.platform}:${session.bot.selfId}`
-        const lock = this._getGroupLocks(session.guildId, botId)
-        return lock.responseLock
+        const muteState = this._getMuteState(session.guildId, botId)
+        return muteState.mute > new Date().getTime()
     }
 
     /**
@@ -144,125 +336,53 @@ export class MessageCollector extends Service {
         session: Session,
         message: Message
     ): Promise<boolean> {
+        const botId = `${session.bot.platform}:${session.bot.selfId}`
         const groupId = session.guildId
-        const botId = `${session.bot.platform}:${session.bot.selfId}`
-
-        await this._lockByGroupId(groupId, botId)
-
-        const lock = this._getGroupLocks(groupId, botId)
-
-        if (!lock.responseLock) {
-            lock.responseLock = true
-            this._unlockByGroupId(groupId, botId)
-            return true
-        }
-
-        // Lock is held, create waiter while holding mutex
-        const botGuildKey = `${groupId}:${botId}`
-        const waiterPromise = new Promise<boolean>((resolve) => {
-            if (!this._responseWaiters[botGuildKey]) {
-                this._responseWaiters[botGuildKey] = []
-            }
-            this._responseWaiters[botGuildKey].push({
-                resolve: () => resolve(true),
-                reject: () => resolve(false)
-            })
-        })
-
-        this._unlockByGroupId(groupId, botId)
-
-        return waiterPromise
-    }
-
-    setResponseLock(session: Session) {
-        const botId = `${session.bot.platform}:${session.bot.selfId}`
-        const lock = this._getGroupLocks(session.guildId, botId)
-        lock.responseLock = true
+        return this._lockManager.acquireResponseLock(groupId, botId)
     }
 
     async releaseResponseLock(session: Session) {
-        const groupId = session.guildId
         const botId = `${session.bot.platform}:${session.bot.selfId}`
-
-        await this._lockByGroupId(groupId, botId)
-
-        try {
-            const lock = this._getGroupLocks(groupId, botId)
-
-            const botGuildKey = `${groupId}:${botId}`
-            const waiters = this._responseWaiters[botGuildKey]
-            lock.responseLock = false
-
-            if (waiters && waiters.length > 0) {
-                // Cancel all old waiters, only wake up the latest one
-                const latestWaiter = waiters.pop()
-                for (const waiter of waiters) {
-                    waiter.reject()
-                }
-                this._responseWaiters[botGuildKey] = []
-
-                if (latestWaiter) {
-                    lock.responseLock = true
-                    latestWaiter.resolve()
-                }
-            }
-        } finally {
-            this._unlockByGroupId(groupId, botId)
-        }
+        const groupId = session.guildId
+        await this._lockManager.releaseResponseLock(groupId, botId)
     }
 
     async cancelPendingWaiters(groupId: string) {
-        // 注意：此方法不支持 botId 参数，取消所有 bot 的等待
-        await this._lockByGroupId(groupId, undefined)
-
-        try {
-            // 取消所有 bot 的等待
-            for (const botGuildKey of Object.keys(this._responseWaiters)) {
-                if (botGuildKey.startsWith(groupId + ':')) {
-                    const waiters = this._responseWaiters[botGuildKey]
-                    if (waiters) {
-                        for (const waiter of waiters) {
-                            waiter.reject('cancelled')
-                        }
-                        this._responseWaiters[botGuildKey] = []
-                    }
-                }
-            }
-        } finally {
-            this._unlockByGroupId(groupId, undefined)
-        }
+        await this._lockManager.cancelResponseWaiters(groupId)
     }
 
     async updateTemp(session: Session, temp: GroupTemp) {
         const botId = `${session.bot.platform}:${session.bot.selfId}`
-        await this._lock(session, botId)
-
         const groupId = session.guildId
 
-        if (!this._groupTemp[groupId]) {
-            this._groupTemp[groupId] = {}
+        await this._lockManager.acquireMutex(groupId, botId)
+        try {
+            if (!this._groupTemp[groupId]) {
+                this._groupTemp[groupId] = {}
+            }
+            this._groupTemp[groupId][botId] = temp
+        } finally {
+            this._lockManager.releaseMutex(groupId, botId)
         }
-        this._groupTemp[groupId][botId] = temp
-
-        await this._unlock(session, botId)
     }
 
     async getTemp(session: Session): Promise<GroupTemp> {
         const botId = `${session.bot.platform}:${session.bot.selfId}`
-        await this._lock(session, botId)
-
         const groupId = session.guildId
 
-        const groupTemp = this._getGroupTemp(groupId, botId)
-        const temp = groupTemp ?? {
-            completionMessages: []
+        await this._lockManager.acquireMutex(groupId, botId)
+        try {
+            const groupTemp = this._getGroupTemp(groupId, botId)
+            const temp = groupTemp ?? {
+                completionMessages: []
+            }
+
+            this._groupTemp[groupId][botId] = temp
+
+            return temp
+        } finally {
+            this._lockManager.releaseMutex(groupId, botId)
         }
-
-        this._groupTemp[groupId][botId] = temp
-
-        await this._unlock(session, botId)
-
-        return temp
     }
 
     private _getGroupTemp(groupId: string, botId: string) {
@@ -277,19 +397,14 @@ export class MessageCollector extends Service {
         return this._groupTemp[groupId][botId]
     }
 
-    private _getGroupLocks(groupId: string, botId?: string) {
-        if (!this._groupLocks[groupId]) {
-            this._groupLocks[groupId] = {}
+    private _getMuteState(groupId: string, botId: string) {
+        if (!this._muteStates[groupId]) {
+            this._muteStates[groupId] = {}
         }
-        const botKey = botId ?? 'default'
-        if (!this._groupLocks[groupId][botKey]) {
-            this._groupLocks[groupId][botKey] = {
-                lock: false,
-                mute: 0,
-                responseLock: false
-            }
+        if (!this._muteStates[groupId][botId]) {
+            this._muteStates[groupId][botId] = { mute: 0 }
         }
-        return this._groupLocks[groupId][botKey]
+        return this._muteStates[groupId][botId]
     }
 
     private _getGroupConfig(groupId: string) {
@@ -300,101 +415,20 @@ export class MessageCollector extends Service {
         return Object.assign({}, config, config.configs[groupId])
     }
 
-    private _lock(session: Session, botId?: string) {
-        const groupLock = this._getGroupLocks(session.guildId, botId)
-        return new Promise<void>((resolve) => {
-            const interval = setInterval(() => {
-                if (!groupLock.lock) {
-                    groupLock.lock = true
-                    clearInterval(interval)
-                    resolve()
-                }
-            }, 100)
-        })
-    }
-
-    private _unlock(session: Session, botId?: string) {
-        const groupLock = this._getGroupLocks(session.guildId, botId)
-        return new Promise<void>((resolve) => {
-            const interval = setInterval(() => {
-                if (groupLock.lock) {
-                    groupLock.lock = false
-                    clearInterval(interval)
-                    resolve()
-                }
-            }, 100)
-        })
-    }
-
-    private _lockByGroupId(groupId: string, botId?: string) {
-        const groupLock = this._getGroupLocks(groupId, botId)
-        return new Promise<void>((resolve) => {
-            const interval = setInterval(() => {
-                if (!groupLock.lock) {
-                    groupLock.lock = true
-                    clearInterval(interval)
-                    resolve()
-                }
-            }, 100)
-        })
-    }
-
-    private _unlockByGroupId(groupId: string, botId?: string) {
-        const groupLock = this._getGroupLocks(groupId, botId)
-        groupLock.lock = false
-    }
-
     async clear(groupId?: string) {
         if (groupId) {
-            await this._lockByGroupId(groupId, undefined)
-            try {
-                this._messages[groupId] = {}
-                // 清除该群组下所有 bot 的临时状态
-                this._groupTemp[groupId] = {}
-                // Cancel waiters directly while holding lock (for all bots in this group)
-                for (const botGuildKey of Object.keys(this._responseWaiters)) {
-                    if (botGuildKey.startsWith(groupId + ':')) {
-                        const waiters = this._responseWaiters[botGuildKey]
-                        if (waiters) {
-                            for (const waiter of waiters) {
-                                waiter.reject('cancelled')
-                            }
-                            this._responseWaiters[botGuildKey] = []
-                        }
-                    }
-                }
-            } finally {
-                this._unlockByGroupId(groupId, undefined)
-            }
+            // Clear specific group
+            this._messages[groupId] = {}
+            this._groupTemp[groupId] = {}
+            this._lockManager.clearGuild(groupId)
             return
         }
 
-        // For clear-all, acquire locks in sorted order to prevent deadlocks
-        const groupIds = Object.keys(this._groupLocks).sort()
-        for (const gid of groupIds) {
-            await this._lockByGroupId(gid, undefined)
-        }
-
-        try {
-            this._messages = {}
-            this._groupTemp = {}
-
-            // Cancel waiters directly while holding locks
-            for (const botGuildKey of Object.keys(this._responseWaiters)) {
-                const waiters = this._responseWaiters[botGuildKey]
-                if (waiters) {
-                    for (const waiter of waiters) {
-                        waiter.reject('cancelled')
-                    }
-                    this._responseWaiters[botGuildKey] = []
-                }
-            }
-        } finally {
-            // Release in reverse order
-            for (let i = groupIds.length - 1; i >= 0; i--) {
-                this._unlockByGroupId(groupIds[i], undefined)
-            }
-        }
+        // Clear all
+        this._messages = {}
+        this._groupTemp = {}
+        this._muteStates = {}
+        this._lockManager.dispose()
     }
 
     async broadcastOnBot(session: Session, elements: h[]) {
@@ -529,10 +563,11 @@ export class MessageCollector extends Service {
         }
     ): Promise<boolean> {
         const botId = `${session.bot.platform}:${session.bot.selfId}`
-        await this._lock(session, botId)
+        const groupId = session.guildId
+
+        await this._lockManager.acquireMutex(groupId, botId)
 
         try {
-            const groupId = session.guildId
             const maxMessageSize = this._config.maxMessages
 
             // 按 botId 存储消息
@@ -582,7 +617,7 @@ export class MessageCollector extends Service {
 
             return filterResult
         } finally {
-            await this._unlock(session, botId)
+            this._lockManager.releaseMutex(groupId, botId)
         }
     }
 

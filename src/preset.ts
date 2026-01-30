@@ -12,6 +12,13 @@ import { fileURLToPath } from 'url'
 import { watch } from 'fs'
 import { ChatLunaService } from 'koishi-plugin-chatluna/services/chat'
 
+// 类型声明：扩展 ChatLunaService 的 promptRenderer 属性
+declare module 'koishi-plugin-chatluna/services/chat' {
+    interface ChatLunaService {
+        promptRenderer: any
+    }
+}
+
 export class Preset {
     private readonly _presets: PresetTemplate[] = []
 
@@ -29,26 +36,31 @@ export class Preset {
         const presetDir = this.resolvePresetDir()
         const files = await fs.readdir(presetDir)
 
+        // 过滤出 yml 文件
+        const ymlFiles = files.filter((file) => path.extname(file) === '.yml')
+
+        // 并行读取和解析所有预设文件
+        const results = await Promise.allSettled(
+            ymlFiles.map(async (file) => {
+                const filePath = path.join(presetDir, file)
+                const rawText = await fs.readFile(filePath, 'utf-8')
+                const preset = loadPreset(rawText)
+                preset.path = filePath
+                return preset
+            })
+        )
+
+        // 清空并重新填充预设列表
         this._presets.length = 0
 
-        for (const file of files) {
-            try {
-                // use file
-                const extension = path.extname(file)
-                if (extension !== '.yml') {
-                    continue
-                }
-                const rawText = await fs.readFile(
-                    path.join(presetDir, file),
-                    'utf-8'
-                )
-                const preset = loadPreset(rawText)
-                preset.path = path.join(presetDir, file)
-                this._presets.push(preset)
-            } catch (e) {
+        for (const result of results) {
+            if (result.status === 'fulfilled') {
+                this._presets.push(result.value)
+            } else {
+                const file = ymlFiles[results.indexOf(result)]
                 this.ctx.chatluna_character.logger.error(
-                    `error when load ${file}`,
-                    e
+                    `error when load preset ${file}:`,
+                    result.reason
                 )
             }
         }
@@ -228,9 +240,7 @@ export function loadPreset(text: string): PresetTemplate {
             format: async (
                 variables: Record<string, string>,
                 variableService: ChatLunaService['promptRenderer'],
-                configurable: Parameters<
-                    ChatLunaService['promptRenderer']['renderTemplate']
-                >[2]['configurable']
+                configurable: any
             ) => {
                 return await variableService
                     .renderTemplate(rawPreset.input, variables, {
@@ -252,9 +262,7 @@ export function loadPreset(text: string): PresetTemplate {
             format: async (
                 variables: Record<string, string>,
                 variableService: ChatLunaService['promptRenderer'],
-                configurable: Parameters<
-                    ChatLunaService['promptRenderer']['renderTemplate']
-                >[2]['configurable']
+                configurable: any
             ) => {
                 return await variableService
                     .renderTemplate(rawPreset.system, variables, {

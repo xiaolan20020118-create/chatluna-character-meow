@@ -105,7 +105,9 @@ export async function apply(ctx: Context, config: Config) {
                     : currentGuildConfig?.preset
                       ? 'guild'
                       : 'global'
-                logger.info(`[Filter] 预设: ${presetName} (来源: ${configSource})`)
+                logger.info(
+                    `[Filter] 预设: ${presetName} (来源: ${configSource})`
+                )
             }
         }
 
@@ -334,6 +336,43 @@ function smoothScore(
 }
 
 /**
+ * 单次遍历统计结果
+ */
+interface WindowCounts {
+    recentCount: number
+    instantCount: number
+    burstCount: number
+    instantIndices: number[] // 记录 instant 消息在 timestamps 中的索引，用于后续间隔计算
+}
+
+/**
+ * 单次遍历统计各窗口内的消息数量和索引
+ */
+function countWindows(timestamps: number[], now: number): WindowCounts {
+    let recentCount = 0
+    let instantCount = 0
+    let burstCount = 0
+    const instantIndices: number[] = []
+
+    for (let i = 0; i < timestamps.length; i++) {
+        const age = now - timestamps[i]
+
+        if (age <= RECENT_WINDOW) {
+            recentCount++
+        }
+        if (age <= INSTANT_WINDOW) {
+            instantCount++
+            instantIndices.push(i)
+        }
+        if (age <= SHORT_BURST_WINDOW) {
+            burstCount++
+        }
+    }
+
+    return { recentCount, instantCount, burstCount, instantIndices }
+}
+
+/**
  * 计算群聊活跃度综合分数
  *
  * 核心思路：
@@ -341,6 +380,7 @@ function smoothScore(
  * 2. 对突发消息进行额外权重处理
  * 3. 使用平滑函数降低尖峰，减少误触发
  * 4. 引入新鲜度与冷却机制
+ * 5. 单次遍历统计所有窗口（优化性能）
  */
 function calculateActivityScore(
     timestamps: number[],
@@ -356,23 +396,17 @@ function calculateActivityScore(
         return { score, timestamp: now }
     }
 
-    const recentMessages = timestamps.filter((ts) => now - ts <= RECENT_WINDOW)
-    if (recentMessages.length < MIN_RECENT_MESSAGES) {
+    // 单次遍历统计所有窗口
+    const counts = countWindows(timestamps, now)
+
+    if (counts.recentCount < MIN_RECENT_MESSAGES) {
         const score = smoothScore(0, previousScore, previousTimestamp, now)
         return { score, timestamp: now }
     }
 
-    const sustainedRate = (recentMessages.length / RECENT_WINDOW) * Time.minute
-
-    const instantMessages = timestamps.filter(
-        (ts) => now - ts <= INSTANT_WINDOW
-    )
-    const instantRate = (instantMessages.length / INSTANT_WINDOW) * Time.minute
-
-    const burstMessages = timestamps.filter(
-        (ts) => now - ts <= SHORT_BURST_WINDOW
-    )
-    const burstRate = (burstMessages.length / SHORT_BURST_WINDOW) * Time.minute
+    const sustainedRate = (counts.recentCount / RECENT_WINDOW) * Time.minute
+    const instantRate = (counts.instantCount / INSTANT_WINDOW) * Time.minute
+    const burstRate = (counts.burstCount / SHORT_BURST_WINDOW) * Time.minute
 
     const sustainedComponent = logistic(
         (sustainedRate - SUSTAINED_RATE_THRESHOLD) / SUSTAINED_RATE_SCALE
@@ -393,15 +427,13 @@ function calculateActivityScore(
         combinedScore += burstContribution * 0.25
     }
 
-    if (instantMessages.length >= 6) {
-        const startIndex = Math.max(
-            timestamps.length - instantMessages.length,
-            0
-        )
-        const relevant = timestamps.slice(startIndex)
+    // 使用记录的索引计算消息间隔
+    if (counts.instantIndices.length >= 6) {
         const intervals: number[] = []
-        for (let i = 1; i < relevant.length; i++) {
-            intervals.push(relevant[i] - relevant[i - 1])
+        for (let i = 1; i < counts.instantIndices.length; i++) {
+            const prevIndex = counts.instantIndices[i - 1]
+            const currIndex = counts.instantIndices[i]
+            intervals.push(timestamps[currIndex] - timestamps[prevIndex])
         }
 
         if (intervals.length > 0) {
@@ -418,7 +450,7 @@ function calculateActivityScore(
     const freshnessFactor = calculateFreshnessFactor(timestamps)
     combinedScore *= 0.55 + 0.45 * freshnessFactor
 
-    if (maxMessages && recentMessages.length >= maxMessages * 0.9) {
+    if (maxMessages && counts.recentCount >= maxMessages * 0.9) {
         combinedScore += 0.08
     }
 

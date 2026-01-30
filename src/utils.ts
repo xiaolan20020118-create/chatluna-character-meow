@@ -823,7 +823,7 @@ export async function createChatLunaChain(
     })
 
     return computed(() => {
-        return RunnableLambda.from((input, options) => {
+        return RunnableLambda.from((input: any, options) => {
             // Update tools before execution
             if (options?.configurable?.session) {
                 const copyOfMessages =
