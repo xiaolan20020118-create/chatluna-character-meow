@@ -1,7 +1,7 @@
 {
     "name": "@kotoko76/koishi-plugin-chatluna-character",
     "description": "Enable multiple bots to use their own presets and large language models for role-playing, disguising themselves as group members. A special version designed to work with the multi-bot-controller-chatluna-charon plugin",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "type": "module",
     "main": "lib/index.cjs",
     "module": "lib/index.mjs",

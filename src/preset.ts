@@ -12,13 +12,6 @@ import { fileURLToPath } from 'url'
 import { watch } from 'fs'
 import { ChatLunaService } from 'koishi-plugin-chatluna/services/chat'
 
-// 类型声明：扩展 ChatLunaService 的 promptRenderer 属性
-declare module 'koishi-plugin-chatluna/services/chat' {
-    interface ChatLunaService {
-        promptRenderer: any
-    }
-}
-
 export class Preset {
     private readonly _presets: PresetTemplate[] = []
 

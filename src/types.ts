@@ -4,13 +4,6 @@ import { ChatLunaService } from 'koishi-plugin-chatluna/services/chat'
 import { ChatLunaChatPromptFormat } from 'koishi-plugin-chatluna/llm-core/chain/prompt'
 import { Session } from 'koishi'
 
-// 类型声明：扩展 ChatLunaService 的 promptRenderer 属性
-declare module 'koishi-plugin-chatluna/services/chat' {
-    interface ChatLunaService {
-        promptRenderer: any
-    }
-}
-
 export interface Message {
     content: string
     name: string

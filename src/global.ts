@@ -3,17 +3,8 @@ import { BotConfig, Message } from './types'
 
 declare module 'koishi' {
     export interface Context {
-        // ChatLuna 服务（来自 koishi-plugin-chatluna）
-        chatluna: {
-            createChatModel(platform: string, modelName: string): Promise<any>
-            createEmbeddings(platform: string, modelName: string): Promise<any>
-            preset?: any
-            platform?: any
-            config?: any
-            promptRenderer?: any
-            messageTransformer?: any
-        }
-
+        // 移除 chatluna 服务的重复声明，使用 chatluna_dify_meow 已有的声明
+        // 仅声明 chatluna_character 独有的服务
         chatluna_character: MessageCollector & {
             botConfig: {
                 setBotConfig(botId: string, config: BotConfig): void
@@ -26,9 +17,7 @@ declare module 'koishi' {
     }
 
     export interface Events {
-        'chatluna/before-check-sender': (
-            session: import('koishi').Session
-        ) => boolean | void | Promise<boolean | void>
+        // 移除 chatluna/before-check-sender 的重复声明
         'chatluna_character/message_collect': (
             session: import('koishi').Session,
             message: Message[]

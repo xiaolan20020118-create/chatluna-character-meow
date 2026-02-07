@@ -195,6 +195,22 @@ export async function apply(ctx: Context, config: Config) {
             appel = session.quote?.user?.id === botId
         }
 
+        if (!appel) {
+            // 从 session.content 中解析 at 元素
+            const content = session.content ?? ''
+            // 获取纯数字的 selfId（不含平台前缀）
+            const selfId = session.bot.selfId
+
+            // 匹配多种格式:
+            // 1. <at id="xxx"/>
+            // 2. <at name='...'>xxx</at>
+            const atRegex1 = new RegExp(`<at\\s+id=["']${botId}["']\\s*/>`)
+            const atRegex2 = new RegExp(`<at\\s+id=["']${selfId}["']\\s*/>`)
+            const atRegex3 = new RegExp(`<at[^>]*>\\s*${botId}\\s*</at>`)
+            const atRegex4 = new RegExp(`<at[^>]*>\\s*${selfId}\\s*</at>`)
+            appel = atRegex1.test(content) || atRegex2.test(content) || atRegex3.test(content) || atRegex4.test(content)
+        }
+
         const isAppel = Boolean(appel)
 
         const muteKeywords = currentPreset.mute_keyword ?? []
